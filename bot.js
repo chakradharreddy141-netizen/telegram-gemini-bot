@@ -40,7 +40,7 @@ const GEMINI_API_KEYS = (process.env.GEMINI_API_KEYS || '')
   .map(s => s.trim())
   .filter(Boolean);
 
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-1.5-flash';
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 const PORT = process.env.PORT || 8080;
 
 // Validate essential configuration

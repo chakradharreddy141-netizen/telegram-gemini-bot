@@ -231,16 +231,23 @@ async function generateGeminiContentWithTools(contents, chatId) {
 
     const systemText = getSystemInstruction();
 
-    // Request payload containing Google Search Grounding and Python Code Execution
+    // Check if conversation history has any active base64 media payload (inlineData)
+    const hasMedia = contents.some(content => 
+      content.parts && content.parts.some(part => part.inlineData)
+    );
+
+    const requestTools = [{ googleSearch: {} }];
+    // Code execution is not supported alongside raw audio/PCM files in same payload
+    if (!hasMedia) {
+      requestTools.push({ codeExecution: {} });
+    }
+
     const requestBody = {
       contents: contents,
       systemInstruction: {
         parts: [{ text: systemText }]
       },
-      tools: [
-        { codeExecution: {} },
-        { googleSearch: {} }
-      ]
+      tools: requestTools
     };
 
     console.log(`[Gemini] Request using Key Index ${activeKeyIndex}...`);

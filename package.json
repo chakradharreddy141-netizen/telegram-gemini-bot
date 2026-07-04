@@ -1,0 +1,14 @@
+{
+  "name": "telegram-gemini-bot",
+  "version": "1.0.0",
+  "description": "24/7 Telegram AI Chatbot with Gemini API key rotation on Koyeb",
+  "main": "bot.js",
+  "type": "module",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {}
+}

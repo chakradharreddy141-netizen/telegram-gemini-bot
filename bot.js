@@ -1,6 +1,9 @@
 import fs from 'fs';
 import path from 'path';
 import http from 'http';
+import officeParser from 'officeparser';
+import fsPromises from 'fs/promises';
+import os from 'os';
 
 // ----------------------------------------------------
 // 1. ENVIRONMENT VARIABLES LOADING (ZERO-DEPENDENCY)
@@ -16,7 +19,6 @@ try {
         if (index > 0) {
           const key = trimmed.substring(0, index).trim();
           const val = trimmed.substring(index + 1).trim();
-          // Remove wrapping quotes if any
           const cleanVal = val.replace(/^["']|["']$/g, '');
           process.env[key] = cleanVal;
         }
@@ -59,7 +61,7 @@ console.log(`[Config] Gemini Keys loaded: ${GEMINI_API_KEYS.length}`);
 console.log(`[Config] Gemini Model: ${GEMINI_MODEL}`);
 
 // ----------------------------------------------------
-// 2. HEALTH CHECK HTTP SERVER FOR KOYEB
+// 2. HEALTH CHECK HTTP SERVER FOR KOYEB / RENDER
 // ----------------------------------------------------
 let activeKeyIndex = 0;
 let requestCount = 0;
@@ -88,15 +90,14 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`[Server] Koyeb Health Check server is listening on port ${PORT}`);
+  console.log(`[Server] Health Check server is listening on port ${PORT}`);
 });
 
 // ----------------------------------------------------
 // 3. CONVERSATION CONTEXT MANAGER
 // ----------------------------------------------------
-// In-memory store: chatId -> array of message objects { role: 'user'|'model', parts: [{text: string}] }
 const chatHistory = new Map();
-const MAX_HISTORY_LEN = 20; // Maximum number of context turns (10 user + 10 model messages)
+const MAX_HISTORY_LEN = 20; // 10 user + 10 model alternating turns
 
 function getChatHistory(chatId) {
   if (!chatHistory.has(chatId)) {
@@ -109,28 +110,155 @@ function clearChatHistory(chatId) {
   chatHistory.delete(chatId);
 }
 
-function addToChatHistory(chatId, role, text) {
-  const history = getChatHistory(chatId);
-  history.push({
-    role: role === 'user' ? 'user' : 'model',
-    parts: [{ text }]
-  });
+// ----------------------------------------------------
+// 4. TEMPORAL AWARENESS & SYSTEM INSTRUCTIONS
+// ----------------------------------------------------
+function getSystemInstruction() {
+  const now = new Date();
+  const options = { 
+    timeZone: 'Asia/Kolkata', 
+    weekday: 'long', 
+    year: 'numeric', 
+    month: 'long', 
+    day: 'numeric', 
+    hour: '2-digit', 
+    minute: '2-digit', 
+    second: '2-digit', 
+    hour12: false 
+  };
+  const formatter = new Intl.DateTimeFormat('en-US', options);
+  const istTime = formatter.format(now);
+  
+  return `You are "Ultimate Executive Assistant", a hella intelligent, highly capable agentic assistant. 
 
-  // Limit window size, keeping it aligned to alternating user/model pattern
-  while (history.length > MAX_HISTORY_LEN) {
-    history.shift();
-  }
+Current Date and Time: ${istTime} (Indian Standard Time).
 
-  // Ensure first message is always from 'user'
-  while (history.length > 0 && history[0].role !== 'user') {
-    history.shift();
+You have access to a set of built-in and custom tools:
+1. Python Code Execution (Native): You can write Python code inside \`\`\`python codeblocks to run calculations, solve logic puzzles, or perform data processing. The code will execute automatically in a secure sandbox, and you will see the output.
+2. Google Search Grounding (Native): You can run live search queries to answer questions requiring real-time info or current events.
+3. Web Reader (fetch_webpage): You can scrape and read plain-text content from webpage URLs sent by the user.
+
+Formatting Constraints:
+- Use bold, italic, code blocks, and lists to make responses clear and readable.
+- Respond in a helpful, concise, and professional tone.`;
+}
+
+// ----------------------------------------------------
+// 5. CUSTOM NODE.JS AGENT TOOLS
+// ----------------------------------------------------
+async function fetchWebpage(url) {
+  try {
+    console.log(`[Tool] fetch_webpage: Querying URL "${url}"...`);
+    const response = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36'
+      }
+    });
+
+    if (!response.ok) {
+      return `Failed to fetch webpage. HTTP Status Code: ${response.status}`;
+    }
+
+    const html = await response.text();
+    // Clean and extract readable text from HTML
+    let text = html
+      .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, ' ')
+      .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, ' ')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    if (text.length > 12000) {
+      text = text.substring(0, 12000) + '\n... [Webpage content truncated to avoid token limit]';
+    }
+
+    return text;
+  } catch (err) {
+    console.error(`[Tool Error] fetch_webpage failed:`, err.message);
+    return `Error reading webpage: ${err.message}`;
   }
 }
 
 // ----------------------------------------------------
-// 4. GEMINI API CLIENT WITH AUTO KEY ROTATION
+// 6. MULTIMODAL & DOCUMENT EXTRACTORS
 // ----------------------------------------------------
-async function generateGeminiContent(contents) {
+async function downloadTelegramFile(fileId) {
+  const getFileUrl = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getFile?file_id=${fileId}`;
+  const getFileRes = await fetch(getFileUrl);
+  if (!getFileRes.ok) {
+    throw new Error(`Failed to query file info from Telegram. Status: ${getFileRes.status}`);
+  }
+  const fileInfo = await getFileRes.json();
+  if (!fileInfo.ok || !fileInfo.result || !fileInfo.result.file_path) {
+    throw new Error('Telegram getFile API returned empty results.');
+  }
+
+  const filePath = fileInfo.result.file_path;
+  const downloadUrl = `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${filePath}`;
+  
+  console.log(`[Bot] Downloading file path: "${filePath}"...`);
+  const downloadRes = await fetch(downloadUrl);
+  if (!downloadRes.ok) {
+    throw new Error(`Failed to download file from Telegram server. Status: ${downloadRes.status}`);
+  }
+
+  const arrayBuffer = await downloadRes.arrayBuffer();
+  return {
+    buffer: Buffer.from(arrayBuffer),
+    fileName: path.basename(filePath),
+    mimeType: fileInfo.result.mime_type || getMimeTypeFromPath(filePath)
+  };
+}
+
+function getMimeTypeFromPath(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  switch (ext) {
+    case '.pdf': return 'application/pdf';
+    case '.png': return 'image/png';
+    case '.jpg':
+    case '.jpeg': return 'image/jpeg';
+    case '.webp': return 'image/webp';
+    case '.gif': return 'image/gif';
+    case '.ogg':
+    case '.oga': return 'audio/ogg';
+    case '.mp3': return 'audio/mp3';
+    case '.wav': return 'audio/wav';
+    case '.txt': return 'text/plain';
+    case '.csv': return 'text/csv';
+    case '.json': return 'application/json';
+    case '.md': return 'text/markdown';
+    default: return 'application/octet-stream';
+  }
+}
+
+async function parseOfficeFile(buffer, fileName) {
+  const tempDir = os.tmpdir();
+  const tempPath = path.join(tempDir, `${Date.now()}_${fileName}`);
+  try {
+    await fsPromises.writeFile(tempPath, buffer);
+    return new Promise((resolve, reject) => {
+      officeParser.parseOffice(tempPath, (data, err) => {
+        if (err) {
+          reject(err);
+        } else {
+          resolve(data);
+        }
+      });
+    });
+  } catch (err) {
+    console.error(`[OfficeParser Error] parseOfficeFile failed:`, err.message);
+    throw err;
+  } finally {
+    try {
+      await fsPromises.unlink(tempPath);
+    } catch {}
+  }
+}
+
+// ----------------------------------------------------
+// 7. GEMINI CALLER WITH ROTATION AND TOOL LOOPS
+// ----------------------------------------------------
+async function generateGeminiContentWithTools(contents, chatId) {
   let attempt = 0;
   const maxAttempts = GEMINI_API_KEYS.length;
 
@@ -138,20 +266,128 @@ async function generateGeminiContent(contents) {
     const apiKey = GEMINI_API_KEYS[activeKeyIndex];
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`;
 
+    const systemText = getSystemInstruction();
+
+    // Build the request body with tools enabled
+    const requestBody = {
+      contents: contents,
+      systemInstruction: {
+        parts: [{ text: systemText }]
+      },
+      tools: [
+        { codeExecution: {} },
+        { googleSearch: {} },
+        {
+          functionDeclarations: [
+            {
+              name: 'fetch_webpage',
+              description: 'Extract and read clean text content from a public webpage URL link.',
+              parameters: {
+                type: 'OBJECT',
+                properties: {
+                  url: {
+                    type: 'STRING',
+                    description: 'The URL of the webpage to scrape.'
+                  }
+                },
+                required: ['url']
+              }
+            }
+          ]
+        }
+      ]
+    };
+
     console.log(`[Gemini] Request using Key Index ${activeKeyIndex}...`);
     try {
       const response = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ contents })
+        body: JSON.stringify(requestBody)
       });
 
       if (response.ok) {
         const data = await response.json();
-        if (data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts[0]) {
-          return data.candidates[0].content.parts[0].text;
+        if (!data.candidates || !data.candidates[0] || !data.candidates[0].content) {
+          throw new Error('Malformed Gemini response format (no content parts).');
         }
-        throw new Error('Malformed Gemini response format (no candidate text).');
+
+        const candidate = data.candidates[0];
+        const parts = candidate.content.parts || [];
+
+        // Check if the model wants to call a function
+        const functionCallPart = parts.find(p => p.functionCall);
+
+        if (functionCallPart) {
+          const fnCall = functionCallPart.functionCall;
+          console.log(`[Gemini Tool] Model requested function call: ${fnCall.name}`, fnCall.args);
+
+          // Append model function call turn to conversation history
+          contents.push({
+            role: 'model',
+            parts: [functionCallPart]
+          });
+
+          // Send typing action to Telegram to indicate progress
+          try {
+            await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendChatAction`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ chat_id: chatId, action: 'typing' })
+            });
+          } catch {}
+
+          // Execute the tool
+          let result = '';
+          if (fnCall.name === 'fetch_webpage') {
+            result = await fetchWebpage(fnCall.args.url);
+          } else {
+            result = `Unknown custom tool requested: ${fnCall.name}`;
+          }
+
+          // Append function response turn to conversation history (role must be 'user')
+          contents.push({
+            role: 'user',
+            parts: [
+              {
+                functionResponse: {
+                  name: fnCall.name,
+                  response: { content: result }
+                }
+              }
+            ]
+          });
+
+          // Call generateContent recursively to feed tool output back to model
+          return await generateGeminiContentWithTools(contents, chatId);
+        }
+
+        // Extract text response
+        let replyText = '';
+        if (parts[0] && parts[0].text) {
+          replyText = parts[0].text;
+        }
+
+        // Add Google Search grounding citations if present
+        const groundingMetadata = candidate.groundingMetadata;
+        if (groundingMetadata && groundingMetadata.groundingChunks) {
+          const chunks = groundingMetadata.groundingChunks;
+          if (chunks.length > 0) {
+            replyText += '\n\n🔍 *Sources:*';
+            const uniqueSources = new Map();
+            chunks.forEach(chunk => {
+              if (chunk.web && chunk.web.uri) {
+                uniqueSources.set(chunk.web.uri, chunk.web.title || 'Source');
+              }
+            });
+            let idx = 1;
+            uniqueSources.forEach((title, uri) => {
+              replyText += `\n${idx++}. [${title}](${uri})`;
+            });
+          }
+        }
+
+        return replyText;
       }
 
       const errText = await response.text();
@@ -171,7 +407,6 @@ async function generateGeminiContent(contents) {
       activeKeyIndex = (activeKeyIndex + 1) % GEMINI_API_KEYS.length;
       keyRotationsCount++;
       attempt++;
-      // Pause briefly before retrying next key
       await new Promise(resolve => setTimeout(resolve, 500));
     }
   }
@@ -180,7 +415,7 @@ async function generateGeminiContent(contents) {
 }
 
 // ----------------------------------------------------
-// 5. TELEGRAM LONG POLLING BOT LOOP
+// 8. TELEGRAM UPDATE HANDLERS
 // ----------------------------------------------------
 let lastUpdateId = 0;
 
@@ -188,7 +423,8 @@ async function sendTelegramMessage(chatId, text, replyToMessageId = null) {
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
   const body = {
     chat_id: chatId,
-    text: text
+    text: text,
+    parse_mode: 'Markdown'
   };
   if (replyToMessageId) {
     body.reply_to_message_id = replyToMessageId;
@@ -213,29 +449,53 @@ async function handleTelegramMessage(message) {
   const chatId = message.chat.id;
   const userId = message.from?.id;
   const username = message.from?.username || 'Unknown';
-  const text = message.text;
-
-  if (!text) return;
-
-  console.log(`[Bot] Received message from user ${userId} (@${username}): "${text}"`);
-
-  // Check authorization if restricted
+  
+  // Check authorization
   if (ALLOWED_USER_IDS.length > 0 && !ALLOWED_USER_IDS.includes(userId)) {
     console.warn(`[Security] Unauthorized access attempt by user ${userId} (@${username}).`);
     await sendTelegramMessage(chatId, "❌ You are not authorized to use this bot.");
     return;
   }
 
-  // Handle Commands
-  if (text.startsWith('/')) {
+  // Check inputs
+  let text = message.text;
+  let caption = message.caption;
+  let fileId = null;
+  let fileType = null;
+
+  if (message.voice) {
+    fileId = message.voice.file_id;
+    fileType = 'voice';
+  } else if (message.audio) {
+    fileId = message.audio.file_id;
+    fileType = 'audio';
+  } else if (message.photo) {
+    // Get highest resolution photo
+    const photo = message.photo[message.photo.length - 1];
+    fileId = photo.file_id;
+    fileType = 'photo';
+  } else if (message.document) {
+    fileId = message.document.file_id;
+    fileType = 'document';
+  }
+
+  // Handle Command Messages
+  if (text && text.startsWith('/')) {
     const command = text.split(' ')[0].toLowerCase();
     
     if (command === '/start') {
-      const welcome = `🤖 *Welcome to the 24/7 Gemini Bot!*\n\n` +
-                      `I am hosted on Koyeb with API key rotation to keep chatting without limits.\n\n` +
+      const welcome = `🤖 *Welcome to the 24/7 Agentic Bot!*\n\n` +
+                      `I am powered by Gemini with API key rotation, system instructions, and advanced tools.\n\n` +
+                      `🛠️ *My Powers:* \n` +
+                      `• 📝 *Read Documents*: Send any PDF, Word, PowerPoint, Excel, or Text file.\n` +
+                      `• 🎙️ *Listen to Audio*: Send voice notes or audio files.\n` +
+                      `• 👁️ *Vision*: Send images and ask me to analyze them.\n` +
+                      `• 🔍 *Google Search*: Ask real-time questions, I will search the web.\n` +
+                      `• 💻 *Python Sandbox*: Ask math or logic puzzles, I will write and run Python code.\n` +
+                      `• 🌐 *Web Reader*: Send a link, and I will read it.\n\n` +
                       `Commands:\n` +
-                      `• /reset - Clear current chat history\n` +
-                      `• /status - Show API key health and metrics`;
+                      `• /reset - Clear chat history\n` +
+                      `• /status - View API stats & status`;
       await sendTelegramMessage(chatId, welcome);
       return;
     }
@@ -258,10 +518,11 @@ async function handleTelegramMessage(message) {
     }
   }
 
-  // Process standard chat query with Gemini
+  if (!text && !caption && !fileId) return;
+
   requestCount++;
   
-  // Send typing indicator
+  // Send typing action
   try {
     await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendChatAction`, {
       method: 'POST',
@@ -270,32 +531,134 @@ async function handleTelegramMessage(message) {
     });
   } catch {}
 
-  // Get current context and add user's new message
   const history = getChatHistory(chatId);
-  addToChatHistory(chatId, 'user', text);
+  const userMessageParts = [];
+
+  // Parse attached files if present
+  if (fileId) {
+    try {
+      const fileData = await downloadTelegramFile(fileId);
+      const ext = path.extname(fileData.fileName).toLowerCase();
+
+      // PDF Document (Native Base64)
+      if (ext === '.pdf') {
+        userMessageParts.push({
+          inlineData: {
+            mimeType: 'application/pdf',
+            data: fileData.buffer.toString('base64')
+          }
+        });
+        userMessageParts.push({
+          text: caption || 'Analyze this PDF file.'
+        });
+      }
+      // Image (Native Base64)
+      else if (fileType === 'photo' || fileData.mimeType.startsWith('image/')) {
+        userMessageParts.push({
+          inlineData: {
+            mimeType: fileData.mimeType,
+            data: fileData.buffer.toString('base64')
+          }
+        });
+        userMessageParts.push({
+          text: caption || 'Analyze this image.'
+        });
+      }
+      // Audio & Voice notes (Native Base64)
+      else if (fileType === 'voice' || fileType === 'audio' || fileData.mimeType.startsWith('audio/')) {
+        userMessageParts.push({
+          inlineData: {
+            mimeType: fileData.mimeType,
+            data: fileData.buffer.toString('base64')
+          }
+        });
+        userMessageParts.push({
+          text: caption || 'Transcribe and respond to this audio file.'
+        });
+      }
+      // Office Files (Word, Excel, PPTX text extraction)
+      else if (['.docx', '.pptx', '.xlsx', '.odt', '.odp', '.ods'].includes(ext)) {
+        console.log(`[Bot] Extracting text from office document: ${fileData.fileName}`);
+        const extractedText = await parseOfficeFile(fileData.buffer, fileData.fileName);
+        userMessageParts.push({
+          text: `[Attached File: ${fileData.fileName}]\n\n${extractedText}\n\n${caption || 'Analyze the content of this document.'}`
+        });
+      }
+      // Plain text files
+      else if (['.txt', '.csv', '.json', '.md', '.py', '.js', '.ts', '.html', '.css'].includes(ext) || fileData.mimeType.startsWith('text/')) {
+        const rawText = fileData.buffer.toString('utf8');
+        userMessageParts.push({
+          text: `[Attached File: ${fileData.fileName}]\n\n${rawText}\n\n${caption || 'Analyze this text file.'}`
+        });
+      }
+      // Fallback
+      else {
+        userMessageParts.push({
+          text: `[Attached File: ${fileData.fileName} (Unsupported text extraction)]\n\n${caption || 'Please review this file.'}`
+        });
+      }
+    } catch (err) {
+      console.error(`[File Error] Failed to process incoming file:`, err.message);
+      await sendTelegramMessage(chatId, `❌ Failed to process attached file: ${err.message}`);
+      return;
+    }
+  } else {
+    // Normal text message
+    userMessageParts.push({ text });
+  }
+
+  // Push user content to memory history
+  history.push({
+    role: 'user',
+    parts: userMessageParts
+  });
+
+  // Limit conversation history size
+  while (history.length > MAX_HISTORY_LEN) {
+    history.shift();
+  }
+  while (history.length > 0 && history[0].role !== 'user') {
+    history.shift();
+  }
 
   try {
-    const replyText = await generateGeminiContent(history);
+    const replyText = await generateGeminiContentWithTools(history, chatId);
     
-    // Add bot's reply to context
-    addToChatHistory(chatId, 'model', replyText);
-    
-    // Send reply to Telegram
+    // Append model response to context
+    history.push({
+      role: 'model',
+      parts: [{ text: replyText }]
+    });
+
+    // RAM Optimization: Clean up large base64 strings from history to conserve resources
+    const lastUserTurn = history[history.length - 2];
+    if (lastUserTurn && lastUserTurn.parts) {
+      lastUserTurn.parts = lastUserTurn.parts.map(part => {
+        if (part.inlineData) {
+          return { text: `[Attached Media: ${part.inlineData.mimeType}]` };
+        }
+        return part;
+      });
+    }
+
+    // Send final message back to Telegram
     await sendTelegramMessage(chatId, replyText, message.message_id);
   } catch (err) {
     failedRequestCount++;
     console.error(`[Process Error] Failed to generate response:`, err.message);
     
     // Remove the last user message from context since the transaction failed
-    const userHistory = getChatHistory(chatId);
-    if (userHistory.length > 0 && userHistory[userHistory.length - 1].role === 'user') {
-      userHistory.pop();
+    if (history.length > 0 && history[history.length - 1].role === 'user') {
+      history.pop();
     }
 
-    await sendTelegramMessage(chatId, `⚠️ Sorry, I encountered an error: ${err.message}\nPlease try again in a moment.`);
+    await sendTelegramMessage(chatId, `⚠️ Sorry, I encountered an error: ${err.message}\nPlease try again.`);
   }
 }
 
+// ----------------------------------------------------
+// 9. POLLING EXECUTION LOOP
+// ----------------------------------------------------
 async function startPolling() {
   console.log('[Bot] Starting Telegram update polling...');
   
@@ -315,7 +678,6 @@ async function startPolling() {
         for (const update of data.result) {
           lastUpdateId = update.update_id + 1;
           if (update.message) {
-            // Process message asynchronously to avoid blocking the polling loop
             handleTelegramMessage(update.message).catch(err => {
               console.error('[Error] Error handling message:', err);
             });
@@ -324,13 +686,11 @@ async function startPolling() {
       }
     } catch (err) {
       console.error('[Polling Error]', err.message);
-      // Wait before retrying to prevent high resource usage during network outages
       await new Promise(resolve => setTimeout(resolve, 5000));
     }
   }
 }
 
-// Start bot polling loop
 startPolling().catch(err => {
   console.error('[Fatal Error] Polling loop crashed:', err);
   process.exit(1);

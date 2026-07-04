@@ -353,6 +353,21 @@ async function sendTelegramMessage(chatId, text, replyToMessageId = null) {
     if (!res.ok) {
       const errText = await res.text();
       console.error(`[Telegram] SendMessage failed. Status: ${res.status}. Error: ${errText}`);
+      
+      // Fallback: If it's a parsing error, retry without Markdown (send as plain text)
+      if (res.status === 400 && (errText.includes('entities') || errText.includes('parse_mode') || errText.includes('Markdown'))) {
+        console.log('[Telegram] Retrying message delivery in plain-text format due to Markdown parsing error...');
+        delete body.parse_mode;
+        const retryRes = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        });
+        if (!retryRes.ok) {
+          const retryErrText = await retryRes.text();
+          console.error(`[Telegram] Plain-text retry also failed. Error: ${retryErrText}`);
+        }
+      }
     }
   } catch (err) {
     console.error(`[Telegram Error] Failed to send message:`, err.message);

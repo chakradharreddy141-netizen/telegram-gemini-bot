@@ -61,7 +61,7 @@ console.log(`[Config] Gemini Keys loaded: ${GEMINI_API_KEYS.length}`);
 console.log(`[Config] Gemini Model: ${GEMINI_MODEL}`);
 
 // ----------------------------------------------------
-// 2. HEALTH CHECK HTTP SERVER FOR KOYEB / RENDER
+// 2. HEALTH CHECK HTTP SERVER FOR RENDER
 // ----------------------------------------------------
 let activeKeyIndex = 0;
 let requestCount = 0;
@@ -133,10 +133,9 @@ function getSystemInstruction() {
 
 Current Date and Time: ${istTime} (Indian Standard Time).
 
-You have access to a set of built-in and custom tools:
-1. Python Code Execution (Native): You can write Python code inside \`\`\`python codeblocks to run calculations, solve logic puzzles, or perform data processing. The code will execute automatically in a secure sandbox, and you will see the output.
-2. Google Search Grounding (Native): You can run live search queries to answer questions requiring real-time info or current events.
-3. Web Reader (fetch_webpage): You can scrape and read plain-text content from webpage URLs sent by the user.
+You have access to a set of built-in tools:
+1. Python Code Execution: You can write Python code inside \`\`\`python codeblocks to run calculations, solve logic puzzles, or perform data processing. The code will execute automatically in a secure sandbox, and you will see the output.
+2. Google Search Grounding: You can run live search queries to answer questions requiring real-time info or current events.
 
 Formatting Constraints:
 - Use bold, italic, code blocks, and lists to make responses clear and readable.
@@ -144,43 +143,7 @@ Formatting Constraints:
 }
 
 // ----------------------------------------------------
-// 5. CUSTOM NODE.JS AGENT TOOLS
-// ----------------------------------------------------
-async function fetchWebpage(url) {
-  try {
-    console.log(`[Tool] fetch_webpage: Querying URL "${url}"...`);
-    const response = await fetch(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36'
-      }
-    });
-
-    if (!response.ok) {
-      return `Failed to fetch webpage. HTTP Status Code: ${response.status}`;
-    }
-
-    const html = await response.text();
-    // Clean and extract readable text from HTML
-    let text = html
-      .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, ' ')
-      .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, ' ')
-      .replace(/<[^>]+>/g, ' ')
-      .replace(/\s+/g, ' ')
-      .trim();
-
-    if (text.length > 12000) {
-      text = text.substring(0, 12000) + '\n... [Webpage content truncated to avoid token limit]';
-    }
-
-    return text;
-  } catch (err) {
-    console.error(`[Tool Error] fetch_webpage failed:`, err.message);
-    return `Error reading webpage: ${err.message}`;
-  }
-}
-
-// ----------------------------------------------------
-// 6. MULTIMODAL & DOCUMENT EXTRACTORS
+// 5. MULTIMODAL & DOCUMENT EXTRACTORS
 // ----------------------------------------------------
 async function downloadTelegramFile(fileId) {
   const getFileUrl = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getFile?file_id=${fileId}`;
@@ -221,7 +184,7 @@ function getMimeTypeFromPath(filePath) {
     case '.gif': return 'image/gif';
     case '.ogg':
     case '.oga': return 'audio/ogg';
-    case '.mp3': return 'audio/mp3';
+    case '.mp3': return 'audio/mpeg';
     case '.wav': return 'audio/wav';
     case '.txt': return 'text/plain';
     case '.csv': return 'text/csv';
@@ -256,7 +219,7 @@ async function parseOfficeFile(buffer, fileName) {
 }
 
 // ----------------------------------------------------
-// 7. GEMINI CALLER WITH ROTATION AND TOOL LOOPS
+// 6. GEMINI CALLER WITH ROTATION AND BUILT-IN TOOLS
 // ----------------------------------------------------
 async function generateGeminiContentWithTools(contents, chatId) {
   let attempt = 0;
@@ -268,7 +231,7 @@ async function generateGeminiContentWithTools(contents, chatId) {
 
     const systemText = getSystemInstruction();
 
-    // Build the request body with tools enabled
+    // Request payload containing Google Search Grounding and Python Code Execution
     const requestBody = {
       contents: contents,
       systemInstruction: {
@@ -276,25 +239,7 @@ async function generateGeminiContentWithTools(contents, chatId) {
       },
       tools: [
         { codeExecution: {} },
-        { googleSearch: {} },
-        {
-          functionDeclarations: [
-            {
-              name: 'fetch_webpage',
-              description: 'Extract and read clean text content from a public webpage URL link.',
-              parameters: {
-                type: 'OBJECT',
-                properties: {
-                  url: {
-                    type: 'STRING',
-                    description: 'The URL of the webpage to scrape.'
-                  }
-                },
-                required: ['url']
-              }
-            }
-          ]
-        }
+        { googleSearch: {} }
       ]
     };
 
@@ -315,58 +260,21 @@ async function generateGeminiContentWithTools(contents, chatId) {
         const candidate = data.candidates[0];
         const parts = candidate.content.parts || [];
 
-        // Check if the model wants to call a function
-        const functionCallPart = parts.find(p => p.functionCall);
-
-        if (functionCallPart) {
-          const fnCall = functionCallPart.functionCall;
-          console.log(`[Gemini Tool] Model requested function call: ${fnCall.name}`, fnCall.args);
-
-          // Append model function call turn to conversation history
-          contents.push({
-            role: 'model',
-            parts: [functionCallPart]
-          });
-
-          // Send typing action to Telegram to indicate progress
-          try {
-            await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendChatAction`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ chat_id: chatId, action: 'typing' })
-            });
-          } catch {}
-
-          // Execute the tool
-          let result = '';
-          if (fnCall.name === 'fetch_webpage') {
-            result = await fetchWebpage(fnCall.args.url);
-          } else {
-            result = `Unknown custom tool requested: ${fnCall.name}`;
-          }
-
-          // Append function response turn to conversation history (role must be 'user')
-          contents.push({
-            role: 'user',
-            parts: [
-              {
-                functionResponse: {
-                  name: fnCall.name,
-                  response: { content: result }
-                }
-              }
-            ]
-          });
-
-          // Call generateContent recursively to feed tool output back to model
-          return await generateGeminiContentWithTools(contents, chatId);
-        }
-
-        // Extract text response
+        // Extract response details
         let replyText = '';
-        if (parts[0] && parts[0].text) {
-          replyText = parts[0].text;
-        }
+        
+        // Loop through parts to display Python code and execution outputs
+        parts.forEach(part => {
+          if (part.text) {
+            replyText += part.text;
+          } else if (part.executableCode) {
+            replyText += `\n\n💻 *Running Python Code:*\n\`\`\`python\n${part.executableCode.code}\n\`\`\``;
+          } else if (part.codeExecutionResult) {
+            const outcome = part.codeExecutionResult.outcome;
+            const output = part.codeExecutionResult.output;
+            replyText += `\n\n⚙️ *Result (${outcome}):*\n\`\`\`\n${output}\n\`\`\``;
+          }
+        });
 
         // Add Google Search grounding citations if present
         const groundingMetadata = candidate.groundingMetadata;
@@ -394,7 +302,6 @@ async function generateGeminiContentWithTools(contents, chatId) {
       console.warn(`[Gemini] Key Index ${activeKeyIndex} failed. Status: ${response.status}. Response: ${errText.substring(0, 200)}`);
 
       if (response.status === 429 || response.status === 400 || response.status >= 500) {
-        // Rotate key and retry
         activeKeyIndex = (activeKeyIndex + 1) % GEMINI_API_KEYS.length;
         keyRotationsCount++;
         attempt++;
@@ -415,7 +322,7 @@ async function generateGeminiContentWithTools(contents, chatId) {
 }
 
 // ----------------------------------------------------
-// 8. TELEGRAM UPDATE HANDLERS
+// 7. TELEGRAM UPDATE HANDLERS
 // ----------------------------------------------------
 let lastUpdateId = 0;
 
@@ -470,7 +377,6 @@ async function handleTelegramMessage(message) {
     fileId = message.audio.file_id;
     fileType = 'audio';
   } else if (message.photo) {
-    // Get highest resolution photo
     const photo = message.photo[message.photo.length - 1];
     fileId = photo.file_id;
     fileType = 'photo';
@@ -491,8 +397,7 @@ async function handleTelegramMessage(message) {
                       `• 🎙️ *Listen to Audio*: Send voice notes or audio files.\n` +
                       `• 👁️ *Vision*: Send images and ask me to analyze them.\n` +
                       `• 🔍 *Google Search*: Ask real-time questions, I will search the web.\n` +
-                      `• 💻 *Python Sandbox*: Ask math or logic puzzles, I will write and run Python code.\n` +
-                      `• 🌐 *Web Reader*: Send a link, and I will read it.\n\n` +
+                      `• 💻 *Python Sandbox*: Ask math or logic puzzles, I will write and run Python code.\n\n` +
                       `Commands:\n` +
                       `• /reset - Clear chat history\n` +
                       `• /status - View API stats & status`;
@@ -565,10 +470,12 @@ async function handleTelegramMessage(message) {
         });
       }
       // Audio & Voice notes (Native Base64)
-      else if (fileType === 'voice' || fileType === 'audio' || fileData.mimeType.startsWith('audio/')) {
+      else if (fileType === 'voice' || fileType === 'audio' || fileData.mimeType.startsWith('audio/') || ext === '.mp3' || ext === '.wav' || ext === '.ogg' || ext === '.oga') {
+        // Enforce formal audio/mpeg for mp3 files
+        const mimeType = ext === '.mp3' ? 'audio/mpeg' : fileData.mimeType;
         userMessageParts.push({
           inlineData: {
-            mimeType: fileData.mimeType,
+            mimeType: mimeType,
             data: fileData.buffer.toString('base64')
           }
         });
@@ -657,7 +564,7 @@ async function handleTelegramMessage(message) {
 }
 
 // ----------------------------------------------------
-// 9. POLLING EXECUTION LOOP
+// 8. POLLING EXECUTION LOOP
 // ----------------------------------------------------
 async function startPolling() {
   console.log('[Bot] Starting Telegram update polling...');
